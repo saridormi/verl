@@ -20,11 +20,14 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
+from string import Template
 from typing import Any, Optional
 
 import numpy as np
@@ -57,11 +60,13 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -324,6 +329,8 @@ class RayPPOTrainer:
 
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
+        self.tokenizer.padding_side = "left"
+        self.tokenizer.truncation_side = config.actor_rollout_ref.actor.get("self_distillation", {}).get("reprompt_truncation", "error")
         self.processor = processor
         self.config = config
         self.reward_fn = reward_fn
@@ -339,7 +346,7 @@ class RayPPOTrainer:
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
+        self.use_reference_policy = need_reference_policy(self.config)
         # legacy reward model implementation
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_reward_loop = self.config.reward_model.use_reward_loop
@@ -353,10 +360,10 @@ class RayPPOTrainer:
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = (
-            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
-            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        )
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -600,8 +607,196 @@ class RayPPOTrainer:
                 reward_tensor = reward_tensor.sum(dim=-1)
             return reward_tensor, reward_extra_infos_dict
 
+    @staticmethod
+    def _collect_feedback(
+        include_environment_feedback: bool,
+        reward_extra_infos_dict: Optional[dict[str, Any]],
+        batch_size: int
+    ) -> list[Any]:
+        """
+        Collect environment feedback from reward_extra_infos_dict.
+
+        Args:
+            include_environment_feedback: Whether to include environment feedback
+            reward_extra_infos_dict: Dictionary containing reward extra information
+            batch_size: Size of the batch
+
+        Returns:
+            List of feedback strings (or None for entries without feedback)
+        """
+        feedback_list: list[Any] = [None] * batch_size
+        if include_environment_feedback and reward_extra_infos_dict is not None:
+            raw_feedback = reward_extra_infos_dict.get("feedback", [])
+            for i in range(min(len(raw_feedback), batch_size)):
+                # Only include non-empty feedback strings
+                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
+                    feedback_list[i] = raw_feedback[i]
+        return feedback_list
+
+    def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
+        seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        uids = batch.non_tensor_batch["uid"]
+        success_by_uid: dict[Any, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            if seq_scores[idx] >= success_reward_threshold:
+                success_by_uid[uid].append(idx)
+        return success_by_uid
+
+    @staticmethod
+    def _remove_thinking_trace(text: str) -> str:
+        """Remove <think>...</think> tags and their content from text."""
+        return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+
+    def _get_solution(
+        self,
+        idx: int,
+        success_by_uid: dict[Any, list[int]],
+        uids: list[Any],
+        response_texts: list[str],
+        dont_reprompt_on_self_success: bool = False,
+        remove_thinking_from_demonstration: bool = False,
+    ) -> Optional[str]:
+        uid = uids[idx]
+        solution_idxs = success_by_uid[uid]
+        if dont_reprompt_on_self_success:
+            solution_idxs = [j for j in solution_idxs if j != idx]
+        if len(solution_idxs) == 0:
+            return None
+        solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
+        solution_str = response_texts[solution_idx]
+        if remove_thinking_from_demonstration:
+            solution_str = self._remove_thinking_trace(solution_str)
+        return solution_str
+
+
+    def _maybe_build_self_distillation_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict[str, list]] = None,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+        if self_distillation_cfg is None or loss_mode != "sdpo":
+            return None
+
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        responses = batch.batch["responses"]
+        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
+        batch_size = batch.batch.batch_size[0]
+
+        # Extract feedback if available and include_environment_feedback is enabled
+        feedback_list = self._collect_feedback(
+            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            batch_size=batch_size,
+        )
+
+        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
+        solution_strs = [
+            self._get_solution(
+                i,
+                success_by_uid,
+                batch.non_tensor_batch["uid"],
+                response_texts,
+                self_distillation_cfg.dont_reprompt_on_self_success,
+                self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+            )
+            for i in range(batch_size)
+        ]
+
+        def _build_teacher_message(i: int) -> list[dict]:
+            system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
+            has_solution = solution_strs[i] is not None
+            has_feedback = feedback_list[i] is not None
+            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+
+            # If feedback_only_without_solution is True, only use feedback when no solution exists
+            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+
+            # build solution section
+            solution_section = ""
+            if has_solution:
+                solution_section = self_distillation_cfg.solution_template.format(
+                    successful_previous_attempt=solution_strs[i]
+                )
+
+            # build feedback section
+            feedback_section = ""
+            if use_feedback:
+                feedback_section = self_distillation_cfg.feedback_template.format(
+                    feedback_raw=feedback_list[i]
+                )
+
+            # combine solution and feedback sections
+            if use_feedback or has_solution:
+                reprompt_text = self_distillation_cfg.reprompt_template.format(
+                    prompt=prompt_texts[i],
+                    solution=solution_section,
+                    feedback=feedback_section,
+                )
+            else:
+                reprompt_text = prompt_texts[i]
+
+            return system_messages + [
+                {"role": "user", "content": reprompt_text},
+            ]
+
+
+        messages = [_build_teacher_message(i) for i in range(batch_size)]
+        enable_thinking = self.config.data.apply_chat_template_kwargs.get("enable_thinking", True) if self.config.data.apply_chat_template_kwargs else True
+        teacher_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            continue_final_message=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+            max_length=self_distillation_cfg.max_reprompt_len,
+            padding=True,
+            truncation=True,
+        )
+        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
+        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+
+        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
+        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+        feedback_used = [
+            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+            for i in range(batch_size)
+        ]
+
+        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
+        self_distillation_mask = torch.tensor(
+            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+            dtype=torch.float32,
+            device=device
+        )
+
+        uids = set(batch.non_tensor_batch["uid"])
+        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+        num_with_feedback_used = sum(1 for f in feedback_used if f)
+        num_with_solution = sum(1 for s in solution_strs if s is not None)
+        metrics = {
+            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
+            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
+            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+        }
+        return DataProto.from_dict(tensors={
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_position_ids": teacher_position_ids,
+            "self_distillation_mask": self_distillation_mask,
+        }), metrics
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -617,7 +812,7 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _validate(self):
+    def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -733,8 +928,18 @@ class RayPPOTrainer:
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
+        if merged:
+            print("_merge_validation_results validate result will be merged")
+            return {
+                "data_sources": data_source_lst,
+                "sample_uids": sample_uids,
+                "sample_turns": sample_turns,
+                "reward_extra_infos_dict": reward_extra_infos_dict,
+            }
         data_sources = np.concatenate(data_source_lst, axis=0)
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -760,6 +965,30 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
+
+    def _merge_validation_results(self, result_a, result_b):
+        if result_a is None and result_b is None:
+            return {}
+        if result_a is None:
+            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+        if result_b is None:
+            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+
+        if not result_a.get("data_sources") and not result_b.get("data_sources"):
+            return {}
+
+        data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
+        sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
+        sample_turns = result_a["sample_turns"] + result_b["sample_turns"]
+
+        reward_extra_infos_dict = {}
+        all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
+        for key in all_keys:
+            list_a = result_a["reward_extra_infos_dict"].get(key, [])
+            list_b = result_b["reward_extra_infos_dict"].get(key, [])
+            reward_extra_infos_dict[key] = list_a + list_b
+
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1210,8 +1439,14 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
-            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+            metadata = {"calculate_entropy": False, "compute_loss": False}
+            if self.ref_in_actor:
+                metadata["no_lora_adapter"] = True
+            tu.assign_non_tensor(batch_td, **metadata)
+            if self.ref_in_actor:
+                output = self.actor_rollout_wg.compute_log_prob(batch_td)
+            else:
+                output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
             # gather output
             log_probs = tu.get(output, "log_probs")
             # step 4. No padding to padding
@@ -1331,6 +1566,7 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
+            group_name=self.config.trainer.get("group_name", None),
         )
 
         self.global_steps = 0
@@ -1547,6 +1783,12 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
+                        if self_distillation_data is not None:
+                            self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            batch = batch.union(self_distillation_batch)
+                            metrics.update(self_distillation_metrics)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
