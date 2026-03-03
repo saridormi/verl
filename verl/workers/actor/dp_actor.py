@@ -830,10 +830,11 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                        sd_response_mask = model_inputs.get("teacher_response_mask", response_mask)
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
                             teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
+                            response_mask=sd_response_mask,
                             self_distillation_config=self_distillation_cfg,
                             old_log_probs=old_log_prob,
                             student_all_log_probs=student_all_logps,

@@ -633,6 +633,64 @@ class RayPPOTrainer:
                     feedback_list[i] = raw_feedback[i]
         return feedback_list
 
+    def _resolve_use_assistant_masks(self) -> bool:
+        """Detect whether the AgentLoop uses assistant masks for prompt/response splitting.
+
+        When assistant masks are active, response tokens begin with the assistant header
+        template, so the teacher prompt must NOT use add_generation_prompt to avoid
+        duplicating it.  When assistant masks are off (or outside AgentLoop), the prompt
+        already contains the generation header and add_generation_prompt=True is correct.
+        """
+        langgraph_cfg = (
+            self.config.actor_rollout_ref.rollout
+            .get("agent", {})
+            .get("langgraph", None)
+        )
+        if langgraph_cfg is None:
+            return False
+        use_assistant_masks = langgraph_cfg.get("use_assistant_masks", "auto")
+        is_available = "{% generation %}" in (self.tokenizer.chat_template or "")
+        if use_assistant_masks == "auto":
+            return is_available
+        return bool(use_assistant_masks)
+
+    @staticmethod
+    def _split_response_into_turns(response_mask: torch.Tensor) -> list[tuple[int, int]]:
+        """Identify turn boundaries from contiguous segments of 1s in response_mask.
+
+        Returns a list of (start, end) index pairs where response_mask==1 for
+        consecutive positions.  Each segment corresponds to one LLM generation turn.
+        Extension point for invoking teacher with per-turn-specific PI for self-distillation.
+        """
+        turns: list[tuple[int, int]] = []
+        mask = response_mask.cpu().tolist()
+        in_turn = False
+        start = 0
+        for i, v in enumerate(mask):
+            if v == 1 and not in_turn:
+                start = i
+                in_turn = True
+            elif v != 1 and in_turn:
+                turns.append((start, i))
+                in_turn = False
+        if in_turn:
+            turns.append((start, len(mask)))
+        return turns
+
+    @staticmethod
+    def _limit_response_mask_to_last_n_turns(
+        response_mask: torch.Tensor,
+        all_turns: list[list[tuple[int, int]]],
+        max_turns: int,
+    ) -> torch.Tensor:
+        """Zero out all but the last ``max_turns`` LLM turns in each sample's mask."""
+        new_mask = response_mask.clone()
+        for i, turns in enumerate(all_turns):
+            if len(turns) > max_turns:
+                cutoff = turns[-max_turns][0]
+                new_mask[i, :cutoff] = 0
+        return new_mask
+
     def _collect_solutions_by_uid(self, batch: DataProto, reward_tensor: torch.Tensor, success_reward_threshold: float) -> dict[Any, list[int]]:
         seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         uids = batch.non_tensor_batch["uid"]
@@ -683,56 +741,202 @@ class RayPPOTrainer:
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
         responses = batch.batch["responses"]
-        response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
-        prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
 
-        # Extract feedback if available and include_environment_feedback is enabled
+        # --- Detect AgentLoop mode ---
+        from jetrl.rollout.constants import JETRL_ROLLOUT_KEY
+
+        has_rollout_data = JETRL_ROLLOUT_KEY in batch.non_tensor_batch
+        solution_format = self_distillation_cfg.get(
+            "solution_format",
+            "full_trajectory" if has_rollout_data else "decoded_tokens",
+        )
+        # --- Build solution texts ---
+        solution_key = self_distillation_cfg.get("solution_key", None)
+        if solution_key and reward_extra_infos_dict and solution_key in reward_extra_infos_dict:
+            solution_source = list(reward_extra_infos_dict[solution_key])
+        else:
+            solution_source = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
+
+        # --- Collect feedback and solutions ---
         feedback_list = self._collect_feedback(
             include_environment_feedback=self_distillation_cfg.include_environment_feedback,
             reward_extra_infos_dict=reward_extra_infos_dict,
             batch_size=batch_size,
         )
 
-        success_by_uid = self._collect_solutions_by_uid(batch, reward_tensor, success_reward_threshold=self_distillation_cfg.success_reward_threshold)
+        success_by_uid = self._collect_solutions_by_uid(
+            batch, reward_tensor,
+            success_reward_threshold=self_distillation_cfg.success_reward_threshold,
+        )
         solution_strs = [
             self._get_solution(
                 i,
                 success_by_uid,
                 batch.non_tensor_batch["uid"],
-                response_texts,
+                solution_source,
                 self_distillation_cfg.dont_reprompt_on_self_success,
                 self_distillation_cfg.get("remove_thinking_from_demonstration", False),
             )
             for i in range(batch_size)
         ]
 
-        def _build_teacher_message(i: int) -> list[dict]:
+        # --- Build teacher messages ---
+        # Two strategies based on solution_format:
+        #   "decoded_tokens" — legacy single-turn: replaces the user message with a
+        #       combined template containing prompt + solution + feedback.
+        #   "full_trajectory" — multi-turn aware: keeps the original prompt messages
+        #       intact and appends new messages (assistant turn with previous solution,
+        #       user turn with reprompt/feedback).
+
+        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+
+        def _has_privileged_info(i: int) -> tuple[bool, bool, bool]:
+            """Return (has_solution, has_feedback, use_feedback) for sample i."""
+            has_sol = solution_strs[i] is not None
+            has_fb = feedback_list[i] is not None
+            use_fb = has_fb and (not feedback_only_without_solution or not has_sol)
+            return has_sol, has_fb, use_fb
+
+        if solution_format == "full_trajectory":
+            messages = self._build_teacher_messages_multiturn(
+                batch, batch_size, solution_strs, feedback_list,
+                self_distillation_cfg, _has_privileged_info,
+            )
+        else:
+            messages = self._build_teacher_messages_decoded(
+                batch, batch_size, solution_strs, feedback_list,
+                self_distillation_cfg, _has_privileged_info,
+            )
+
+        # --- Tokenize teacher prompt ---
+        langgraph_cfg = (
+            self.config.actor_rollout_ref.rollout
+            .get("agent", {})
+            .get("langgraph", None)
+        )
+        if langgraph_cfg is not None:
+            chat_template_kwargs = dict(langgraph_cfg.get("chat_template_kwargs", {}) or {})
+        else:
+            raw_kwargs = self.config.data.get("apply_chat_template_kwargs", None)
+            chat_template_kwargs = dict(raw_kwargs) if raw_kwargs else {}
+
+        use_assistant_masks = self._resolve_use_assistant_masks()
+        add_generation_prompt = not use_assistant_masks
+
+        teacher_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            continue_final_message=False,
+            add_generation_prompt=add_generation_prompt,
+            max_length=self_distillation_cfg.max_reprompt_len,
+            padding=True,
+            truncation=True,
+            **chat_template_kwargs,
+        )
+        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
+        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+
+        # --- Compute masks and metrics ---
+        feedback_used = [_has_privileged_info(i)[2] for i in range(batch_size)]
+
+        self_distillation_mask = torch.tensor(
+            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+            dtype=torch.float32,
+            device=device,
+        )
+
+        uids = set(batch.non_tensor_batch["uid"])
+        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+        num_with_feedback_used = sum(1 for f in feedback_used if f)
+        num_with_solution = sum(1 for s in solution_strs if s is not None)
+
+        metrics = {
+            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
+            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
+            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            "self_distillation/solution_format": solution_format,
+            "self_distillation/use_assistant_masks": float(use_assistant_masks),
+        }
+
+        # --- Per-turn mask limiting ---
+        distillation_max_turns = self_distillation_cfg.get("distillation_max_turns", None)
+        teacher_response_mask = response_mask
+        if has_rollout_data:
+            all_turns = [
+                self._split_response_into_turns(response_mask[i])
+                for i in range(batch_size)
+            ]
+            turn_counts = [len(t) for t in all_turns]
+            metrics["self_distillation/avg_turns"] = sum(turn_counts) / batch_size
+
+            if distillation_max_turns is not None and distillation_max_turns > 0:
+                teacher_response_mask = self._limit_response_mask_to_last_n_turns(
+                    response_mask, all_turns, distillation_max_turns,
+                )
+                kept_counts = [min(tc, distillation_max_turns) for tc in turn_counts]
+                metrics["self_distillation/avg_distilled_turns"] = sum(kept_counts) / batch_size
+
+        tensors = {
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_position_ids": teacher_position_ids,
+            "self_distillation_mask": self_distillation_mask,
+        }
+        if teacher_response_mask is not response_mask:
+            tensors["teacher_response_mask"] = teacher_response_mask
+
+        return DataProto.from_dict(tensors=tensors), metrics
+
+    # ------------------------------------------------------------------
+    # Teacher message builders
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_teacher_messages_decoded(
+        batch: DataProto,
+        batch_size: int,
+        solution_strs: list[Optional[str]],
+        feedback_list: list[Optional[str]],
+        cfg,
+        has_privileged_info_fn,
+    ) -> list[list[dict]]:
+        """Legacy single-turn strategy: embed prompt + solution + feedback in one
+        user message via the reprompt_template / solution_template / feedback_template
+        string templates."""
+        prompt_texts: list[str] = []
+        for raw_prompt in batch.non_tensor_batch["raw_prompt"]:
+            user_content = None
+            for msg in raw_prompt:
+                if msg.get("role") == "user":
+                    user_content = msg["content"]
+                    break
+            prompt_texts.append(user_content or raw_prompt[-1]["content"])
+
+        result: list[list[dict]] = []
+        for i in range(batch_size):
             system_messages = batch.non_tensor_batch["raw_prompt"][i][:-1]
-            has_solution = solution_strs[i] is not None
-            has_feedback = feedback_list[i] is not None
-            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+            has_sol, _, use_fb = has_privileged_info_fn(i)
 
-            # If feedback_only_without_solution is True, only use feedback when no solution exists
-            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
-
-            # build solution section
             solution_section = ""
-            if has_solution:
-                solution_section = self_distillation_cfg.solution_template.format(
+            if has_sol:
+                solution_section = cfg.solution_template.format(
                     successful_previous_attempt=solution_strs[i]
                 )
 
-            # build feedback section
             feedback_section = ""
-            if use_feedback:
-                feedback_section = self_distillation_cfg.feedback_template.format(
+            if use_fb:
+                feedback_section = cfg.feedback_template.format(
                     feedback_raw=feedback_list[i]
                 )
 
-            # combine solution and feedback sections
-            if use_feedback or has_solution:
-                reprompt_text = self_distillation_cfg.reprompt_template.format(
+            if has_sol or use_fb:
+                reprompt_text = cfg.reprompt_template.format(
                     prompt=prompt_texts[i],
                     solution=solution_section,
                     feedback=feedback_section,
@@ -740,60 +944,55 @@ class RayPPOTrainer:
             else:
                 reprompt_text = prompt_texts[i]
 
-            return system_messages + [
-                {"role": "user", "content": reprompt_text},
-            ]
+            result.append(system_messages + [{"role": "user", "content": reprompt_text}])
+        return result
 
+    @staticmethod
+    def _build_teacher_messages_multiturn(
+        batch: DataProto,
+        batch_size: int,
+        solution_strs: list[Optional[str]],
+        feedback_list: list[Optional[str]],
+        cfg,
+        has_privileged_info_fn,
+    ) -> list[list[dict]]:
+        """Multi-turn strategy: keep the original prompt messages and append a
+        single user message with all privileged information via the templates.
 
-        messages = [_build_teacher_message(i) for i in range(batch_size)]
-        enable_thinking = self.config.data.apply_chat_template_kwargs.get("enable_thinking", True) if self.config.data.apply_chat_template_kwargs else True
-        teacher_prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            return_tensors="pt",
-            return_dict=True,
-            continue_final_message=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-            max_length=self_distillation_cfg.max_reprompt_len,
-            padding=True,
-            truncation=True,
-        )
-        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
-        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
-        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+        Teacher prompt structure:
+            [original prompt messages] [user: reprompt with solution + feedback]
+        When neither solution nor feedback exists the original prompt is
+        returned unchanged.
+        """
+        result: list[list[dict]] = []
+        for i in range(batch_size):
+            original_messages = list(batch.non_tensor_batch["raw_prompt"][i])
+            has_sol, _, use_fb = has_privileged_info_fn(i)
 
-        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
-        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
-        feedback_used = [
-            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
-            for i in range(batch_size)
-        ]
+            if not has_sol and not use_fb:
+                result.append(original_messages)
+                continue
 
-        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
-        self_distillation_mask = torch.tensor(
-            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
-            dtype=torch.float32,
-            device=device
-        )
+            solution_section = ""
+            if has_sol:
+                solution_section = cfg.solution_template.format(
+                    successful_previous_attempt=solution_strs[i]
+                )
 
-        uids = set(batch.non_tensor_batch["uid"])
-        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
-        num_with_feedback_used = sum(1 for f in feedback_used if f)
-        num_with_solution = sum(1 for s in solution_strs if s is not None)
-        metrics = {
-            "self_distillation/success_group_fraction": len([uid for uid in uids if len(success_by_uid[uid]) > 0]) / len(uids),
-            "self_distillation/success_sample_fraction": num_with_solution / batch_size,
-            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
-            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
-            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
-        }
-        return DataProto.from_dict(tensors={
-            "teacher_input_ids": teacher_input_ids,
-            "teacher_attention_mask": teacher_attention_mask,
-            "teacher_position_ids": teacher_position_ids,
-            "self_distillation_mask": self_distillation_mask,
-        }), metrics
+            feedback_section = ""
+            if use_fb:
+                feedback_section = cfg.feedback_template.format(
+                    feedback_raw=feedback_list[i]
+                )
+
+            reprompt_content = cfg.reprompt_template.format(
+                prompt="",
+                solution=solution_section,
+                feedback=feedback_section,
+            )
+            original_messages.append({"role": "user", "content": reprompt_content})
+            result.append(original_messages)
+        return result
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
