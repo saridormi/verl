@@ -90,6 +90,10 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    solution_key: Optional[str] = None
+    solution_format: str = "decoded_tokens"
+    distillation_max_turns: Optional[int] = None
+    per_turn_distillation: bool = False
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
