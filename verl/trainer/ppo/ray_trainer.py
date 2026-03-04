@@ -731,7 +731,7 @@ class RayPPOTrainer:
             return feedback_list
 
         raw_feedback = reward_extra_infos_dict.get("feedback", [])
-        if not raw_feedback:
+        if len(raw_feedback) == 0:
             return feedback_list
 
         seq_scores = None
