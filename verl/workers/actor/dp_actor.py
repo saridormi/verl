@@ -815,8 +815,13 @@ class DataParallelPPOActor(BasePPOActor):
                 data, self_distillation_cfg, temperature,
             )
             if precomputed is not None:
+                was_locked = data.batch.is_locked
+                if was_locked:
+                    data.batch.unlock_()
                 for key, val in precomputed.items():
                     data.batch[key] = val
+                if was_locked:
+                    data.batch.lock_()
             else:
                 per_turn_distillation = False
 
