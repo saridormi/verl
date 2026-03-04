@@ -94,6 +94,7 @@ class SelfDistillationConfig(BaseConfig):
     solution_format: str = "decoded_tokens"
     distillation_max_turns: Optional[int] = None
     per_turn_distillation: bool = False
+    per_turn_max_teacher_len: Optional[int] = None
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -114,6 +115,10 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.per_turn_max_teacher_len is not None and self.per_turn_max_teacher_len <= 0:
+            raise ValueError(
+                f"self_distillation.per_turn_max_teacher_len must be positive, got {self.per_turn_max_teacher_len}"
+            )
 
 
 @dataclass

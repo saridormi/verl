@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import re
 import time
@@ -70,6 +71,8 @@ from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -553,6 +556,15 @@ class RayPPOTrainer:
 
         wandb = logger.logger["wandb"]
 
+        if "per_turn_rows" in log_data:
+            self._log_sd_generations_per_turn(wandb, log_data["per_turn_rows"], generations_to_log)
+        else:
+            self._log_sd_generations_whole(wandb, log_data, generations_to_log)
+
+    def _log_sd_generations_whole(self, wandb, log_data, generations_to_log):
+        """Log whole-trajectory self-distillation samples as a wandb table."""
+        import numpy as np
+
         samples = list(
             zip(
                 log_data["teacher_inputs"],
@@ -586,8 +598,41 @@ class RayPPOTrainer:
         new_table.add_data(*row_data)
 
         if wandb.run is not None:
-            wandb.log({"train/sd_generations": new_table}, step=self.global_steps)
+            wandb.log({"self_distillation/sd_generations": new_table}, step=self.global_steps)
         self._sd_generations_table = new_table
+
+    def _log_sd_generations_per_turn(self, wandb, per_turn_rows, generations_to_log):
+        """Log per-turn self-distillation samples as a wandb table (one row per turn)."""
+        import numpy as np
+
+        if not per_turn_rows:
+            return
+
+        rng = np.random.RandomState(42)
+        rows = list(per_turn_rows)
+        rng.shuffle(rows)
+        rows = rows[:generations_to_log]
+
+        columns = ["step", "sample", "turn", "teacher_input", "model_output", "solution", "feedback"]
+
+        if not hasattr(self, "_sd_generations_table_pt"):
+            self._sd_generations_table_pt = wandb.Table(columns=columns)
+
+        new_table = wandb.Table(columns=columns, data=self._sd_generations_table_pt.data)
+        for row in rows:
+            new_table.add_data(
+                self.global_steps,
+                row["sample"],
+                row["turn"],
+                row["teacher_input"],
+                row["model_output"],
+                row["solution"],
+                row["feedback"],
+            )
+
+        if wandb.run is not None:
+            wandb.log({"self_distillation/sd_generations_per_turn": new_table}, step=self.global_steps)
+        self._sd_generations_table_pt = new_table
 
     def _compute_or_extract_reward(
         self,
@@ -915,6 +960,9 @@ class RayPPOTrainer:
         # --- Per-turn mask limiting ---
         distillation_max_turns = self_distillation_cfg.get("distillation_max_turns", None)
         teacher_response_mask = response_mask
+        per_turn_meta: dict[str, Any] = {}
+        per_turn_distillation = self_distillation_cfg.get("per_turn_distillation", False)
+
         if has_rollout_data:
             all_turns = [
                 self._split_response_into_turns(response_mask[i])
@@ -923,12 +971,34 @@ class RayPPOTrainer:
             turn_counts = [len(t) for t in all_turns]
             metrics["self_distillation/avg_turns"] = sum(turn_counts) / batch_size
 
-            if distillation_max_turns is not None and distillation_max_turns > 0:
+            if per_turn_distillation:
+                per_turn_data, per_turn_metrics, per_turn_decoded = self._build_per_turn_teacher_batch(
+                    batch=batch,
+                    batch_size=batch_size,
+                    responses=responses,
+                    all_turns=all_turns,
+                    solution_strs=solution_strs,
+                    feedback_list=feedback_list,
+                    self_distillation_cfg=self_distillation_cfg,
+                    has_privileged_info_fn=_has_privileged_info,
+                    chat_template_kwargs=chat_template_kwargs,
+                    use_assistant_masks=use_assistant_masks,
+                    distillation_max_turns=distillation_max_turns,
+                )
+                metrics.update(per_turn_metrics)
+                if per_turn_data:
+                    per_turn_meta["per_turn_teacher_data"] = per_turn_data
+                    per_turn_meta["per_turn_distillation"] = True
+                    per_turn_meta["per_turn_response_length"] = responses.shape[1]
+                    per_turn_meta["per_turn_batch_size"] = batch_size
+            elif distillation_max_turns is not None and distillation_max_turns > 0:
                 teacher_response_mask = self._limit_response_mask_to_last_n_turns(
                     response_mask, all_turns, distillation_max_turns,
                 )
                 kept_counts = [min(tc, distillation_max_turns) for tc in turn_counts]
                 metrics["self_distillation/avg_distilled_turns"] = sum(kept_counts) / batch_size
+        elif per_turn_distillation:
+            logger.warning("per_turn_distillation requires AgentLoop rollout data; falling back to whole-trajectory mode.")
 
         tensors = {
             "teacher_input_ids": teacher_input_ids,
@@ -939,14 +1009,33 @@ class RayPPOTrainer:
         if teacher_response_mask is not response_mask:
             tensors["teacher_response_mask"] = teacher_response_mask
 
-        log_data = {
-            "teacher_inputs": self.tokenizer.batch_decode(teacher_prompt["input_ids"], skip_special_tokens=True),
-            "model_outputs": self.tokenizer.batch_decode(responses, skip_special_tokens=True),
-            "solutions": [s or "" for s in solution_strs],
-            "feedback": [f or "" for f in feedback_list],
-        }
+        if per_turn_distillation and per_turn_meta.get("per_turn_distillation"):
+            per_turn_rows: list[dict[str, Any]] = []
+            for i, turns in enumerate(per_turn_decoded):
+                for k, (prompt_str, response_str) in enumerate(turns):
+                    per_turn_rows.append({
+                        "sample": i,
+                        "turn": k + 1,
+                        "teacher_input": prompt_str,
+                        "model_output": response_str,
+                        "solution": str(solution_strs[i]) if solution_strs[i] else "",
+                        "feedback": str(feedback_list[i]) if feedback_list[i] else "",
+                    })
+            log_data = {"per_turn_rows": per_turn_rows}
+        else:
+            log_data = {
+                "teacher_inputs": self.tokenizer.batch_decode(
+                    teacher_prompt["input_ids"], skip_special_tokens=True,
+                ),
+                "model_outputs": self.tokenizer.batch_decode(responses, skip_special_tokens=True),
+                "solutions": [str(s) if s else "" for s in solution_strs],
+                "feedback": [str(f) if f else "" for f in feedback_list],
+            }
 
-        return DataProto.from_dict(tensors=tensors), metrics, log_data
+        sd_batch = DataProto.from_dict(tensors=tensors)
+        sd_batch.meta_info.update(per_turn_meta)
+
+        return sd_batch, metrics, log_data
 
     # ------------------------------------------------------------------
     # Teacher message builders
@@ -1048,6 +1137,190 @@ class RayPPOTrainer:
             original_messages.append({"role": "user", "content": reprompt_content})
             result.append(original_messages)
         return result
+
+    def _build_per_turn_teacher_batch(
+        self,
+        batch: DataProto,
+        batch_size: int,
+        responses: torch.Tensor,
+        all_turns: list[list[tuple[int, int]]],
+        solution_strs: list[Optional[str]],
+        feedback_list: list[Optional[str]],
+        self_distillation_cfg,
+        has_privileged_info_fn,
+        chat_template_kwargs: dict,
+        use_assistant_masks: bool,
+        distillation_max_turns: Optional[int],
+    ) -> tuple[dict[str, np.ndarray], dict[str, float], list[list[tuple[str, str]]]]:
+        """Build per-turn teacher inputs for per-turn self-distillation.
+
+        For each (sample, turn_k), constructs a teacher input consisting of
+        the trajectory up to turn_k (as properly formatted messages) plus
+        privileged information, concatenated with turn_k's response tokens.
+
+        Returns a tuple of (per_turn_data dict, metrics dict,
+        per_sample_decoded) where per_sample_decoded[i] is a list of
+        (teacher_prompt_str, turn_response_str) pairs for sample i's turns.
+        """
+        from langchain_core.messages import AIMessage, BaseMessage, convert_to_openai_messages
+
+        from jetrl.rollout.constants import JETRL_ROLLOUT_KEY
+
+        max_teacher_len = (
+            self_distillation_cfg.get("per_turn_max_teacher_len", None)
+            or self_distillation_cfg.max_reprompt_len
+        )
+        add_generation_prompt = not use_assistant_masks
+
+        per_turn_input_ids_list: list[torch.Tensor] = []
+        per_turn_attention_mask_list: list[torch.Tensor] = []
+        per_turn_responses_list: list[torch.Tensor] = []
+        mapping_list: list[tuple[int, int, int]] = []  # (sample_idx, turn_start, turn_end)
+        per_sample_decoded: list[list[tuple[str, str]]] = [[] for _ in range(batch_size)]
+
+        for i in range(batch_size):
+            turns = all_turns[i]
+            if not turns:
+                continue
+
+            if distillation_max_turns is not None and distillation_max_turns > 0:
+                turns = turns[-distillation_max_turns:]
+
+            has_sol, _, use_fb = has_privileged_info_fn(i)
+            if not has_sol and not use_fb:
+                continue
+
+            rollout_data = batch.non_tensor_batch.get(JETRL_ROLLOUT_KEY)
+            if rollout_data is None:
+                continue
+            rollout_messages: list[BaseMessage] = rollout_data[i].get("messages", [])
+            if not rollout_messages:
+                continue
+
+            ai_indices = [
+                j for j, m in enumerate(rollout_messages) if isinstance(m, AIMessage)
+            ]
+            if len(ai_indices) != len(all_turns[i]):
+                logger.warning(
+                    f"Sample {i}: AIMessage count ({len(ai_indices)}) != "
+                    f"turn count ({len(all_turns[i])}). "
+                    "Skipping per-turn distillation for this sample."
+                )
+                continue
+
+            pi_content = self._format_pi_content(
+                solution_strs[i], feedback_list[i], has_sol, use_fb, self_distillation_cfg,
+            )
+
+            offset = len(all_turns[i]) - len(turns)
+            for local_k, (turn_start, turn_end) in enumerate(turns):
+                global_k = offset + local_k
+                ai_msg_idx = ai_indices[global_k]
+
+                prefix_messages = list(rollout_messages[:ai_msg_idx])
+                prefix_messages.append({"role": "user", "content": pi_content})
+
+                openai_msgs = convert_to_openai_messages(
+                    [m for m in prefix_messages if isinstance(m, BaseMessage)]
+                ) + [
+                    m for m in prefix_messages if isinstance(m, dict)
+                ]
+
+                teacher_prompt = self.tokenizer.apply_chat_template(
+                    openai_msgs,
+                    tokenize=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                    continue_final_message=False,
+                    add_generation_prompt=add_generation_prompt,
+                    max_length=max_teacher_len,
+                    padding=False,
+                    truncation=True,
+                    **chat_template_kwargs,
+                )
+
+                turn_response_tokens = responses[i, turn_start:turn_end].unsqueeze(0)
+                prompt_ids = teacher_prompt["input_ids"]
+                prompt_mask = teacher_prompt["attention_mask"]
+
+                entry_input_ids = torch.cat([prompt_ids, turn_response_tokens], dim=1)
+                entry_attention_mask = torch.cat(
+                    [prompt_mask, torch.ones_like(turn_response_tokens)], dim=1,
+                )
+
+                per_turn_input_ids_list.append(entry_input_ids.squeeze(0))
+                per_turn_attention_mask_list.append(entry_attention_mask.squeeze(0))
+                per_turn_responses_list.append(responses[i, turn_start:turn_end])
+                mapping_list.append((i, turn_start, turn_end))
+                per_sample_decoded[i].append((
+                    self.tokenizer.decode(prompt_ids.squeeze(0), skip_special_tokens=True),
+                    self.tokenizer.decode(responses[i, turn_start:turn_end], skip_special_tokens=True),
+                ))
+
+        metrics: dict[str, float] = {
+            "self_distillation/per_turn_total_entries": len(per_turn_input_ids_list),
+            "self_distillation/per_turn_avg_entries_per_sample": (
+                len(per_turn_input_ids_list) / batch_size if batch_size > 0 else 0.0
+            ),
+        }
+
+        if not per_turn_input_ids_list:
+            return {}, metrics, per_sample_decoded
+
+        max_input_len = max(t.shape[0] for t in per_turn_input_ids_list)
+        max_resp_len = max(t.shape[0] for t in per_turn_responses_list)
+        pad_id = self.tokenizer.pad_token_id or 0
+        total = len(per_turn_input_ids_list)
+
+        padded_input_ids = torch.full((total, max_input_len), pad_id, dtype=torch.long)
+        padded_attention_mask = torch.zeros((total, max_input_len), dtype=torch.long)
+        padded_responses = torch.full((total, max_resp_len), pad_id, dtype=torch.long)
+
+        for idx in range(total):
+            ids = per_turn_input_ids_list[idx]
+            mask = per_turn_attention_mask_list[idx]
+            resp = per_turn_responses_list[idx]
+            padded_input_ids[idx, :ids.shape[0]] = ids
+            padded_attention_mask[idx, :mask.shape[0]] = mask
+            padded_responses[idx, :resp.shape[0]] = resp
+
+        padded_position_ids = compute_position_id_with_mask(padded_attention_mask)
+        mapping_tensor = torch.tensor(mapping_list, dtype=torch.long)
+
+        per_turn_data = {
+            "per_turn_teacher_input_ids": padded_input_ids.cpu().numpy(),
+            "per_turn_teacher_attention_mask": padded_attention_mask.cpu().numpy(),
+            "per_turn_teacher_position_ids": padded_position_ids.cpu().numpy(),
+            "per_turn_teacher_responses": padded_responses.cpu().numpy(),
+            "per_turn_teacher_mapping": mapping_tensor.cpu().numpy(),
+        }
+
+        return per_turn_data, metrics, per_sample_decoded
+
+    @staticmethod
+    def _format_pi_content(
+        solution_str: Optional[str],
+        feedback_str: Optional[str],
+        has_sol: bool,
+        use_fb: bool,
+        cfg,
+    ) -> str:
+        """Format privileged information content for a teacher turn."""
+        solution_section = ""
+        if has_sol:
+            solution_section = cfg.solution_template.format(
+                successful_previous_attempt=solution_str
+            )
+        feedback_section = ""
+        if use_fb:
+            feedback_section = cfg.feedback_template.format(
+                feedback_raw=feedback_str
+            )
+        return cfg.reprompt_template.format(
+            prompt="",
+            solution=solution_section,
+            feedback=feedback_section,
+        )
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()

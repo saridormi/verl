@@ -672,6 +672,119 @@ class DataParallelPPOActor(BasePPOActor):
             outputs["sum_pi_squared"] = sum_pi_squared
         return outputs
 
+    def _precompute_per_turn_teacher_logprobs(
+        self,
+        data: DataProto,
+        self_distillation_cfg,
+        temperature: float,
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Pre-compute teacher logprobs via per-turn forward passes.
+
+        Reads the per-turn teacher data from ``data.meta_info``, runs the
+        teacher model on each per-turn entry with micro-batching, and scatters
+        the resulting logprobs (and optionally full/top-k log-probs) back to
+        tensors of shape ``[batch_size, response_length]``.
+
+        Returns ``None`` when per-turn data is absent.
+        """
+        per_turn_data = data.meta_info.get("per_turn_teacher_data")
+        if per_turn_data is None:
+            return None
+
+        device = get_device_id()
+        batch_size = data.meta_info["per_turn_batch_size"]
+        response_length = data.meta_info["per_turn_response_length"]
+
+        pt_input_ids = torch.as_tensor(per_turn_data["per_turn_teacher_input_ids"], device=device)
+        pt_attention_mask = torch.as_tensor(per_turn_data["per_turn_teacher_attention_mask"], device=device)
+        pt_position_ids = torch.as_tensor(per_turn_data["per_turn_teacher_position_ids"], device=device)
+        pt_responses = torch.as_tensor(per_turn_data["per_turn_teacher_responses"], device=device)
+        pt_mapping = torch.as_tensor(per_turn_data["per_turn_teacher_mapping"], device=device)
+
+        total_entries = pt_input_ids.shape[0]
+        if total_entries == 0:
+            return None
+
+        teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+        teacher_model = self.teacher_module or self.actor_module
+        if teacher_regularization == "trust-region" and (
+            self.teacher_module is None or self.teacher_module is self.actor_module
+        ):
+            raise ValueError("trust-region teacher requires a separate teacher_module.")
+
+        return_all_logps = (
+            self_distillation_cfg.full_logit_distillation
+            and not self_distillation_cfg.distillation_topk
+        )
+        distill_topk = (
+            self_distillation_cfg.distillation_topk
+            if self_distillation_cfg.full_logit_distillation
+            else None
+        )
+
+        micro_bs = self.config.ppo_micro_batch_size_per_gpu or total_entries
+        collected_logprobs: list[tuple[torch.Tensor, int, int, int]] = []
+        collected_all_logps: list[tuple[torch.Tensor, int, int, int]] = []
+        collected_topk_logps: list[tuple[torch.Tensor, int, int, int]] = []
+
+        for start in range(0, total_entries, micro_bs):
+            end = min(start + micro_bs, total_entries)
+            mb_inputs = {
+                "input_ids": pt_input_ids[start:end],
+                "attention_mask": pt_attention_mask[start:end],
+                "position_ids": pt_position_ids[start:end],
+                "responses": pt_responses[start:end],
+            }
+            with torch.no_grad():
+                mb_outputs = self._forward_micro_batch(
+                    mb_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                    return_all_logps=return_all_logps,
+                    distill_topk=distill_topk,
+                    module=teacher_model,
+                )
+
+            mb_mapping = pt_mapping[start:end]
+            for local_idx in range(end - start):
+                sample_idx = mb_mapping[local_idx, 0].item()
+                turn_start = mb_mapping[local_idx, 1].item()
+                turn_end = mb_mapping[local_idx, 2].item()
+                turn_len = turn_end - turn_start
+                lp = mb_outputs["log_probs"][local_idx, :turn_len]
+                collected_logprobs.append((lp, sample_idx, turn_start, turn_end))
+                if return_all_logps and "all_logps" in mb_outputs:
+                    collected_all_logps.append(
+                        (mb_outputs["all_logps"][local_idx, :turn_len], sample_idx, turn_start, turn_end)
+                    )
+                if distill_topk and "topk_logps" in mb_outputs:
+                    collected_topk_logps.append(
+                        (mb_outputs["topk_logps"][local_idx, :turn_len], sample_idx, turn_start, turn_end)
+                    )
+
+        result: dict[str, torch.Tensor] = {}
+
+        scattered_lp = torch.zeros(batch_size, response_length, device=device)
+        for lp, si, ts, te in collected_logprobs:
+            scattered_lp[si, ts:te] = lp
+        result["teacher_log_probs"] = scattered_lp
+
+        if collected_all_logps:
+            vocab = collected_all_logps[0][0].shape[-1]
+            scattered_all = torch.zeros(batch_size, response_length, vocab, device=device)
+            for alp, si, ts, te in collected_all_logps:
+                scattered_all[si, ts:te] = alp
+            result["teacher_all_logps"] = scattered_all
+
+        if collected_topk_logps:
+            k = collected_topk_logps[0][0].shape[-1]
+            scattered_topk = torch.zeros(batch_size, response_length, k, device=device)
+            for tlp, si, ts, te in collected_topk_logps:
+                scattered_topk[si, ts:te] = tlp
+            result["teacher_topk_logps"] = scattered_topk
+
+        return result
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
@@ -683,6 +796,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         self_distillation_enabled = loss_mode == "sdpo"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        per_turn_distillation = (
+            self_distillation_enabled
+            and data.meta_info.get("per_turn_distillation", False)
+        )
+
         if self_distillation_enabled:
             self_distillation_required_keys = {
                 "teacher_input_ids",
@@ -691,6 +809,16 @@ class DataParallelPPOActor(BasePPOActor):
                 "self_distillation_mask",
             }
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
+
+        if per_turn_distillation:
+            precomputed = self._precompute_per_turn_teacher_logprobs(
+                data, self_distillation_cfg, temperature,
+            )
+            if precomputed is not None:
+                for key, val in precomputed.items():
+                    data.batch[key] = val
+            else:
+                per_turn_distillation = False
 
         select_keys = [
             "responses",
@@ -707,6 +835,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("ref_log_prob")
         if self_distillation_enabled:
             select_keys.extend(list(self_distillation_required_keys))
+        if per_turn_distillation:
+            for pt_key in ("teacher_log_probs", "teacher_all_logps", "teacher_topk_logps"):
+                if pt_key in data.batch.keys():
+                    select_keys.append(pt_key)
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -806,30 +938,35 @@ class DataParallelPPOActor(BasePPOActor):
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
                     if self_distillation_enabled:
-                        teacher_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_input_ids"],
-                            "attention_mask": model_inputs["teacher_attention_mask"],
-                            "position_ids": model_inputs["teacher_position_ids"],
-                        }
-                        teacher_model = self.teacher_module or self.actor_module
-                        if teacher_regularization == "trust-region" and (
-                            self.teacher_module is None or self.teacher_module is self.actor_module
-                        ):
-                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
-                        with torch.no_grad():
-                            teacher_outputs = self._forward_micro_batch(
-                                teacher_inputs,
-                                temperature=temperature,
-                                calculate_entropy=False,
-                                return_all_logps=return_all_logps,
-                                distill_topk=distill_topk,
-                                topk_indices=student_topk_indices,
-                                module=teacher_model,
-                            )
-                        teacher_log_prob = teacher_outputs["log_probs"]
-                        teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
-                        teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                        if per_turn_distillation:
+                            teacher_log_prob = model_inputs["teacher_log_probs"]
+                            teacher_all_logps = model_inputs.get("teacher_all_logps") if return_all_logps else None
+                            teacher_topk_logps = model_inputs.get("teacher_topk_logps") if distill_topk else None
+                        else:
+                            teacher_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids"],
+                                "attention_mask": model_inputs["teacher_attention_mask"],
+                                "position_ids": model_inputs["teacher_position_ids"],
+                            }
+                            teacher_model = self.teacher_module or self.actor_module
+                            if teacher_regularization == "trust-region" and (
+                                self.teacher_module is None or self.teacher_module is self.actor_module
+                            ):
+                                raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                            with torch.no_grad():
+                                teacher_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                            teacher_log_prob = teacher_outputs["log_probs"]
+                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
                         sd_response_mask = model_inputs.get("teacher_response_mask", response_mask)
                         pg_loss, pg_metrics = compute_self_distillation_loss(
                             student_log_probs=log_prob,
