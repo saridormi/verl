@@ -704,26 +704,48 @@ class RayPPOTrainer:
     def _collect_feedback(
         include_environment_feedback: bool,
         reward_extra_infos_dict: Optional[dict[str, Any]],
-        batch_size: int
+        batch_size: int,
+        reward_tensor: Optional[torch.Tensor] = None,
+        success_reward_threshold: Optional[float] = None,
     ) -> list[Any]:
         """
         Collect environment feedback from reward_extra_infos_dict.
 
+        When ``include_environment_feedback`` is True, feedback is included for
+        every sample.  When False, feedback is still included for *unsuccessful*
+        samples (reward below ``success_reward_threshold``) so the teacher
+        prompt can surface environment signals for failing trajectories.
+
         Args:
-            include_environment_feedback: Whether to include environment feedback
+            include_environment_feedback: Whether to include environment feedback for all samples
             reward_extra_infos_dict: Dictionary containing reward extra information
             batch_size: Size of the batch
+            reward_tensor: Per-sample reward tensor used to determine success
+            success_reward_threshold: Reward threshold above which a sample is considered successful
 
         Returns:
             List of feedback strings (or None for entries without feedback)
         """
         feedback_list: list[Any] = [None] * batch_size
-        if include_environment_feedback and reward_extra_infos_dict is not None:
-            raw_feedback = reward_extra_infos_dict.get("feedback", [])
-            for i in range(min(len(raw_feedback), batch_size)):
-                # Only include non-empty feedback strings
-                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
-                    feedback_list[i] = raw_feedback[i]
+        if reward_extra_infos_dict is None:
+            return feedback_list
+
+        raw_feedback = reward_extra_infos_dict.get("feedback", [])
+        if not raw_feedback:
+            return feedback_list
+
+        seq_scores = None
+        if not include_environment_feedback and reward_tensor is not None and success_reward_threshold is not None:
+            seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+
+        for i in range(min(len(raw_feedback), batch_size)):
+            if not (raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip()):
+                continue
+            if include_environment_feedback:
+                feedback_list[i] = raw_feedback[i]
+            elif seq_scores is not None and seq_scores[i] < success_reward_threshold:
+                feedback_list[i] = raw_feedback[i]
+
         return feedback_list
 
     def _resolve_use_assistant_masks(self) -> bool:
@@ -856,6 +878,8 @@ class RayPPOTrainer:
             include_environment_feedback=self_distillation_cfg.include_environment_feedback,
             reward_extra_infos_dict=reward_extra_infos_dict,
             batch_size=batch_size,
+            reward_tensor=reward_tensor,
+            success_reward_threshold=self_distillation_cfg.success_reward_threshold,
         )
 
         success_by_uid = self._collect_solutions_by_uid(
