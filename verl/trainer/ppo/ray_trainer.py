@@ -541,6 +541,54 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _maybe_log_sd_generations(self, logger, log_data):
+        """Log a table of self-distillation samples (teacher input, model output, solution, feedback) to wandb."""
+        generations_to_log = self.config.trainer.get("log_sd_generations", 0)
+        if generations_to_log == 0:
+            return
+        if "wandb" not in logger.logger:
+            return
+
+        import numpy as np
+
+        wandb = logger.logger["wandb"]
+
+        samples = list(
+            zip(
+                log_data["teacher_inputs"],
+                log_data["model_outputs"],
+                log_data["solutions"],
+                log_data["feedback"],
+                strict=True,
+            )
+        )
+        samples.sort(key=lambda x: x[0])
+
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+        samples = samples[:generations_to_log]
+
+        columns = ["step"] + sum(
+            [
+                [f"teacher_input_{i + 1}", f"model_output_{i + 1}", f"solution_{i + 1}", f"feedback_{i + 1}"]
+                for i in range(len(samples))
+            ],
+            [],
+        )
+
+        if not hasattr(self, "_sd_generations_table"):
+            self._sd_generations_table = wandb.Table(columns=columns)
+
+        new_table = wandb.Table(columns=columns, data=self._sd_generations_table.data)
+        row_data = [self.global_steps]
+        for sample in samples:
+            row_data.extend(sample)
+        new_table.add_data(*row_data)
+
+        if wandb.run is not None:
+            wandb.log({"train/sd_generations": new_table}, step=self.global_steps)
+        self._sd_generations_table = new_table
+
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -891,7 +939,14 @@ class RayPPOTrainer:
         if teacher_response_mask is not response_mask:
             tensors["teacher_response_mask"] = teacher_response_mask
 
-        return DataProto.from_dict(tensors=tensors), metrics
+        log_data = {
+            "teacher_inputs": self.tokenizer.batch_decode(teacher_prompt["input_ids"], skip_special_tokens=True),
+            "model_outputs": self.tokenizer.batch_decode(responses, skip_special_tokens=True),
+            "solutions": [s or "" for s in solution_strs],
+            "feedback": [f or "" for f in feedback_list],
+        }
+
+        return DataProto.from_dict(tensors=tensors), metrics, log_data
 
     # ------------------------------------------------------------------
     # Teacher message builders
@@ -1985,9 +2040,10 @@ class RayPPOTrainer:
 
                         self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
                         if self_distillation_data is not None:
-                            self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            self_distillation_batch, self_distillation_metrics, sd_log_data = self_distillation_data
                             batch = batch.union(self_distillation_batch)
                             metrics.update(self_distillation_metrics)
+                            self._maybe_log_sd_generations(logger, sd_log_data)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
