@@ -60,6 +60,10 @@ class SelfDistillationConfig(BaseConfig):
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        grpo_advantage_mix (Optional[float]): When set to a float in [0, 1], enables SDPO+GRPO
+            advantage-level combination. The combined advantage is
+            A = grpo_advantage_mix * A_GRPO + (1 - grpo_advantage_mix) * A_SDPO, used in a single
+            PPO clip loss. None (default) keeps existing pure SDPO KL-based loss.
     """
 
     full_logit_distillation: bool = True
@@ -95,6 +99,7 @@ class SelfDistillationConfig(BaseConfig):
     distillation_max_turns: Optional[int] = None
     per_turn_distillation: bool = False
     per_turn_max_teacher_len: Optional[int] = None
+    grpo_advantage_mix: Optional[float] = None
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -118,6 +123,10 @@ class SelfDistillationConfig(BaseConfig):
         if self.per_turn_max_teacher_len is not None and self.per_turn_max_teacher_len <= 0:
             raise ValueError(
                 f"self_distillation.per_turn_max_teacher_len must be positive, got {self.per_turn_max_teacher_len}"
+            )
+        if self.grpo_advantage_mix is not None and not 0.0 <= self.grpo_advantage_mix <= 1.0:
+            raise ValueError(
+                f"self_distillation.grpo_advantage_mix must be in [0,1], got {self.grpo_advantage_mix}"
             )
 
 

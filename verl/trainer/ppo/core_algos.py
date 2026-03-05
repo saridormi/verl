@@ -1188,6 +1188,65 @@ def compute_self_distillation_loss(
     return loss, metrics
 
 
+def compute_sdpo_grpo_loss(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    grpo_advantage_mix: float,
+    loss_agg_mode: str,
+    config: Any,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute SDPO+GRPO loss with advantage-level combination.
+
+    Combines reward-derived GRPO advantages with feedback-derived SDPO advantages:
+        A_combined = lambda * A_GRPO + (1 - lambda) * A_SDPO
+    where A_SDPO_t = teacher_log_prob_t - student_log_prob_t (the reverse-KL gradient
+    signal reinterpreted as a per-token advantage).
+
+    The combined advantage is used in a single PPO clip loss.
+
+    Args:
+        student_log_probs: Log-probs from current policy. Shape (bs, resp_len).
+        teacher_log_probs: Log-probs from teacher (privileged prompt). Shape (bs, resp_len).
+        old_log_probs: Log-probs from rollout policy. Shape (bs, resp_len).
+        advantages: GRPO advantages from batch. Shape (bs, resp_len).
+        response_mask: Token mask. Shape (bs, resp_len).
+        grpo_advantage_mix: Lambda in [0, 1]. 1.0 = pure GRPO, 0.0 = pure SDPO advantage.
+        loss_agg_mode: Aggregation mode for agg_loss.
+        config: ActorConfig with clip_ratio, etc.
+        self_distillation_mask: Per-sample mask (1 = has privileged info). Shape (bs,).
+        rollout_is_weights: Optional rollout correction weights. Shape (bs, resp_len).
+    """
+    a_sdpo = (teacher_log_probs - student_log_probs).detach()
+
+    if self_distillation_mask is not None:
+        a_sdpo = a_sdpo * self_distillation_mask.unsqueeze(1)
+
+    a_combined = grpo_advantage_mix * advantages + (1 - grpo_advantage_mix) * a_sdpo
+
+    loss, pg_metrics = compute_policy_loss_vanilla(
+        old_log_prob=old_log_probs,
+        log_prob=student_log_probs,
+        advantages=a_combined,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+    )
+
+    metrics: dict[str, Any] = {}
+    metrics.update(pg_metrics)
+    metrics["self_distillation/a_sdpo_mean"] = verl_F.masked_mean(a_sdpo, response_mask).detach().item()
+    metrics["self_distillation/a_grpo_mean"] = verl_F.masked_mean(advantages, response_mask).detach().item()
+    metrics["self_distillation/a_combined_mean"] = verl_F.masked_mean(a_combined, response_mask).detach().item()
+
+    return loss, metrics
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,
